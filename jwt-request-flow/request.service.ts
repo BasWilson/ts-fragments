@@ -1,26 +1,27 @@
 import Axios, { AxiosInstance, AxiosResponse } from "axios";
+import { EventEmitter } from "events";
 import requests from "./requests";
 import IRequest from "./i.request";
 
 class RequestService {
 
-    private reqQue: IRequest[];
     private baseUrl: string;
     private dev: boolean;
-    private busy: boolean = true;
+    private emitter: EventEmitter;
+    private locked: boolean;
     private access_token: string;
     private refresh_token: string;
     private axios: AxiosInstance;
-    private errorCount: number;
 
     constructor() {
 
+        this.locked = false;
+        this.emitter = new EventEmitter();
+
         this.readStorage();
 
-        this.reqQue = [];
-
         // Determine if its dev
-        this.dev = location.hostname == "localhost";
+        this.dev = location.hostname == "localhost" || location.hostname == "";
 
         // Determine base url
         this.baseUrl = this.dev ?
@@ -36,63 +37,36 @@ class RequestService {
             validateStatus: (status) => status < 499
         });
 
-        this.errorCount = 0;
-        this.busy = false;
+        this.locked = false;
     }
 
-    public que = async (request: IRequest | IRequest[]) => {
+    public que = async (request: IRequest): Promise<any> => {
 
-        if (Array.isArray(request)) {
-            this.reqQue = this.reqQue.concat(request);
-        } else {
-            // Add to que
-            this.reqQue.push(request);
-        }
+        // Wait until unlocked!
+        if (this.locked) await new Promise(resolve => this.emitter.once('unlocked', resolve));
 
-        // If not busy, execute que
-        if (!this.busy) {
-            await this.executeQue();
-        }
-    }
+        // Lock the que
+        this.locked = true;
 
-    private executeQue = async () => {
+        // Execute request
+        const result = await this.executeRequest(request);
 
-        this.busy = true;
+        // Unlock the que
+        this.locked = false;
 
-        if (this.reqQue.length > 0) {
-            const request = this.reqQue[0];
-            const executed = await this.executeRequest(request);
+        // Emit unlocked event
+        this.emitter.emit('unlocked');
 
-            // If request executes correctly or fails more than 3 times remove from que.
-            if (executed || this.errorCount > 0 || request.dontRetry) {
-                this.errorCount = 0;
-                this.reqQue.splice(0, 1);
-
-                // Check if it errored 3 times, call the errorCallback if it exists
-                if (request.errorCallback && this.errorCount > 0) {
-                    request.errorCallback({ error: "timeout" });
-                }
-            } else {
-                this.errorCount++;
-            }
-        }
-
-        // If theres more left in the que, keep executing them recursivly
-        if (this.reqQue.length > 0) {
-            await this.executeQue();
-        } else {
-            // Nothing left in que. We're not busy anymore!
-            this.busy = false;
-        }
+        // Return the result
+        return result;
     }
 
     /**
      * Returns false if request needs to be rerun
      * @param request 
      */
-    private executeRequest = async (request: IRequest): Promise<boolean> => {
+    private executeRequest = async (request: IRequest): Promise<any> => {
         try {
-
             let response: AxiosResponse;
 
             // Set auth header
@@ -100,10 +74,12 @@ class RequestService {
                 withCredentials: true,
                 baseURL: this.baseUrl,
                 headers: {
-                    "Authorization": `Bearer ${this.access_token}`
+                    "Authorization": `Bearer ${this.access_token}`,
+                    "Content-Type": request.contentType ? request.contentType : "application/json"
                 },
                 validateStatus: (status) => status < 499
             });
+
             switch (request.method) {
                 case "GET":
                     response = await this.axios.get(request.path);
@@ -119,38 +95,55 @@ class RequestService {
                     break;
             }
 
-            console.log("REQUEST_EXECUTED:", response);
             // If response fails because access_token is expired, refresh first and re-execute this request.
             if (response.status === 401) {
                 // unauthorized, refresh our access token
-                await this.refresh();
+                const refreshed = await this.refresh();
 
-                // Return false so the request can be called again after the refresh
-                return false;
+                // Access token has been refreshed, call ourselves again
+                if (refreshed) {
+                    return await this.executeRequest(request);
+                } else {
+                    return {
+                        error: "Unauthorized",
+                        message: ["Unauthorized"]
+                    }
+                }
             }
 
             // Check if successfull
             if (response.status >= 200 && response.status <= 400) {
-                if (request.callback) {
-                    request.callback(response.data);
+                const { data } = response;
+
+                // Transform the message array to single string if its an array of errors
+                if (data.error) {
+                    if (Array.isArray(data.message)) {
+                        data.message = data.message[0];
+                        response.data = data;
+                    }
                 }
 
-                return true;
+                console.log("REQUEST_EXECUTED:", response);
+                return response.data;
             }
 
-            return false;
+            throw "Reached unhandled code " + response.status;
+
         } catch (error) {
             console.error(error);
-            return false;
+            return {
+                error: "unknownError",
+                message: ["unknownError"]
+            }
         }
     }
 
     /**
      * Refresh the JWT token
      */
-    private refresh = async () => {
+    private refresh = async (): Promise<boolean> => {
         if (!this.refresh_token) {
-            return;
+            return false;
         }
 
         const response = await this.axios.post(
@@ -162,7 +155,7 @@ class RequestService {
 
         if (response.status == 401) {
             // Our refresh token is invalid, clear que etc.
-            this.clearQue();
+            return false;
         } else if (response.status >= 200 && response.status < 300) {
             // Assign new refresh_token and access_token
             this.access_token = response.data.access_token;
@@ -171,6 +164,7 @@ class RequestService {
             // Update local storage
             localStorage.setItem("refresh_token", this.refresh_token);
             localStorage.setItem("access_token", this.access_token);
+            return true;
         }
     }
 
@@ -219,11 +213,6 @@ class RequestService {
         if (access_token) {
             this.access_token = access_token;
         }
-    }
-
-    private clearQue = () => {
-        this.reqQue = [];
-        this.busy = false;
     }
 }
 
